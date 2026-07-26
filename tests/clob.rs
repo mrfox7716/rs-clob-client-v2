@@ -2475,6 +2475,67 @@ mod authenticated {
     }
 
     #[tokio::test]
+    async fn trades_should_accept_empty_fee_rate_bps() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let client = create_authenticated(&server).await?;
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/data/trades");
+            then.status(StatusCode::OK).json_body(json!({
+                "data": [{
+                    "id": "1",
+                    "taker_order_id": "taker_123",
+                    "market": "0x000000000000000000000000000000000000000000000000000000006d61726b",
+                    "asset_id": token_1(),
+                    "side": "BUY",
+                    "size": "5",
+                    "fee_rate_bps": "",
+                    "price": "0.47",
+                    "status": "MATCHED",
+                    "match_time": "1705322096",
+                    "last_update": "1705322130",
+                    "outcome": "DOWN",
+                    "bucket_index": 2,
+                    "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                    "maker_address": "0x2222222222222222222222222222222222222222",
+                    "maker_orders": [{
+                        "order_id": "maker_001",
+                        "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                        "maker_address": "0x4444444444444444444444444444444444444444",
+                        "matched_amount": "5",
+                        "price": "0.47",
+                        "fee_rate_bps": "",
+                        "asset_id": token_1(),
+                        "outcome": "DOWN",
+                        "side": "BUY"
+                    }],
+                    "transaction_hash": "",
+                    "trader_side": "MAKER"
+                }],
+                "limit": 1,
+                "count": 1,
+                "next_cursor": "LTE="
+            }));
+        });
+
+        let response = client
+            .trades(&TradesRequest::builder().build(), None)
+            .await?;
+
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].fee_rate_bps, Decimal::ZERO);
+        assert_eq!(response.data[0].maker_orders.len(), 1);
+        assert_eq!(
+            response.data[0].maker_orders[0].fee_rate_bps,
+            Decimal::ZERO
+        );
+        assert!(response.data[0].transaction_hash.is_zero());
+        mock.assert();
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn notifications_should_succeed() -> anyhow::Result<()> {
         let server = MockServer::start();
         let client = create_authenticated(&server).await?;
