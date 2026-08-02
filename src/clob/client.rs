@@ -1740,7 +1740,23 @@ impl<K: Kind> Client<Authenticated<K>> {
         reason = "No need to publicly document as we are guarded by the typestate pattern. \
         We cannot call `sign` without first calling `authenticate`"
     )]
-    pub async fn sign<S: Signer>(
+    pub async fn sign<S: Signer>(&self, signer: &S, order: SignableOrder) -> Result<SignedOrder> {
+        self.sign_with_order_hash(signer, order)
+            .await
+            .map(|(signed, _)| signed)
+    }
+
+    /// Signs the provided [`SignableOrder`] and returns the exact EIP-712 order hash.
+    ///
+    /// The returned hash is the deterministic CLOB order identifier for the exact order
+    /// payload. It is computed from the same domain and typed data used for signing, before
+    /// the signed order is submitted to the venue.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "No need to publicly document as we are guarded by the typestate pattern. \
+        We cannot call `sign_with_order_hash` without first calling `authenticate`"
+    )]
+    pub async fn sign_with_order_hash<S: Signer>(
         &self,
         signer: &S,
         SignableOrder {
@@ -1749,7 +1765,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             post_only,
             defer_exec,
         }: SignableOrder,
-    ) -> Result<SignedOrder> {
+    ) -> Result<(SignedOrder, B256)> {
         let chain_id = signer
             .chain_id()
             .expect("Validated not none in `authenticate`");
@@ -1762,7 +1778,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         let config = contract_config(chain_id, neg_risk)
             .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
 
-        let signature = match &payload {
+        let (signature, order_hash) = match &payload {
             OrderPayload::V2(p) => {
                 let exchange = config.exchange_v2.ok_or_else(|| {
                     Error::validation(format!(
@@ -1776,15 +1792,14 @@ impl<K: Kind> Client<Authenticated<K>> {
                     verifying_contract: Some(exchange),
                     ..Eip712Domain::default()
                 };
-                if p.order.signatureType == SignatureType::Poly1271 as u8 {
+                let order_hash = p.order.eip712_signing_hash(&domain);
+                let signature = if p.order.signatureType == SignatureType::Poly1271 as u8 {
                     self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
                         .await?
                 } else {
-                    signer
-                        .sign_hash(&p.order.eip712_signing_hash(&domain))
-                        .await?
-                        .into()
-                }
+                    signer.sign_hash(&order_hash).await?.into()
+                };
+                (signature, order_hash)
             }
             OrderPayload::V1(p) => {
                 let domain = Eip712Domain {
@@ -1794,21 +1809,22 @@ impl<K: Kind> Client<Authenticated<K>> {
                     verifying_contract: Some(config.exchange),
                     ..Eip712Domain::default()
                 };
-                signer
-                    .sign_hash(&p.order.eip712_signing_hash(&domain))
-                    .await?
-                    .into()
+                let order_hash = p.order.eip712_signing_hash(&domain);
+                (signer.sign_hash(&order_hash).await?.into(), order_hash)
             }
         };
 
-        Ok(SignedOrder {
-            payload,
-            signature,
-            order_type,
-            owner: self.state().credentials.key,
-            post_only,
-            defer_exec,
-        })
+        Ok((
+            SignedOrder {
+                payload,
+                signature,
+                order_type,
+                owner: self.state().credentials.key,
+                post_only,
+                defer_exec,
+            },
+            order_hash,
+        ))
     }
 
     async fn sign_poly1271_order<S: Signer>(

@@ -4173,6 +4173,11 @@ mod v2 {
 
         #[tokio::test]
         async fn v2_poly1271_signing_matches_deposit_wallet_signature() -> anyhow::Result<()> {
+            use std::borrow::Cow;
+
+            use alloy::dyn_abi::Eip712Domain;
+            use alloy::sol_types::SolStruct as _;
+
             let server = MockServer::start();
             let signer = LocalSigner::from_str(PRIVATE_KEY)?.with_chain_id(Some(AMOY));
             let deposit_wallet = address!("0x1111111111111111111111111111111111111111");
@@ -4213,9 +4218,23 @@ mod v2 {
                 .order_type(OrderType::GTC)
                 .build();
 
-            let signed = client.sign(&signer, signable).await?;
+            let expected_domain = Eip712Domain {
+                name: Some(Cow::Borrowed("Polymarket CTF Exchange")),
+                version: Some(Cow::Borrowed("2")),
+                chain_id: Some(U256::from(AMOY)),
+                verifying_contract: polymarket_client_sdk_v2::contract_config(AMOY, false)
+                    .and_then(|config| config.exchange_v2),
+                ..Eip712Domain::default()
+            };
+            let expected_order_hash = signable
+                .payload
+                .as_v2()
+                .expect("expected V2 payload")
+                .eip712_signing_hash(&expected_domain);
+            let (signed, order_hash) = client.sign_with_order_hash(&signer, signable).await?;
 
             assert_eq!(signed.signature.to_string(), EXPECTED_POLY_1271_SIGNATURE);
+            assert_eq!(order_hash, expected_order_hash);
             assert_eq!(
                 signed.signature.to_string().len(),
                 2 + 130 + 64 + 64 + (186 * 2) + 4
