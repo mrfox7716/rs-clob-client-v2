@@ -48,6 +48,7 @@ fn validate_bound(
 /// - `size_threshold`: Minimum position size to include (default: 1).
 /// - `redeemable`: If true, only return positions that can be redeemed.
 /// - `mergeable`: If true, only return positions that can be merged.
+/// - `include_archived`: If true, include active positions in archived markets.
 /// - `limit`: Maximum positions to return (0-500, default: 100).
 /// - `offset`: Pagination offset (0-10000, default: 0).
 /// - `sort_by`: Sort criteria (default: TOKENS).
@@ -83,6 +84,9 @@ pub struct PositionsRequest {
     pub redeemable: Option<bool>,
     /// Only return positions that can be merged (default: false).
     pub mergeable: Option<bool>,
+    /// Include active positions in archived markets (default: false).
+    #[serde(rename = "includeArchived")]
+    pub include_archived: Option<bool>,
     /// Maximum number of positions to return (0-500, default: 100).
     #[builder(with = |v: i32| -> Result<_, BoundedIntError> { validate_bound(v, 0, 500, "limit") })]
     pub limit: Option<i32>,
