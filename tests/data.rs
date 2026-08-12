@@ -117,7 +117,8 @@ mod positions {
                 .query_param("user", "0x1234567890abcdef1234567890abcdef12345678")
                 .query_param("limit", "10")
                 .query_param("offset", "5")
-                .query_param("redeemable", "true");
+                .query_param("redeemable", "true")
+                .query_param("includeArchived", "true");
             then.status(StatusCode::OK).json_body(json!([]));
         });
 
@@ -126,6 +127,7 @@ mod positions {
             .limit(10)?
             .offset(5)?
             .redeemable(true)
+            .include_archived(true)
             .build();
 
         let response = client.positions(&request).await?;
