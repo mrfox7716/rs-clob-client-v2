@@ -57,6 +57,25 @@ impl ConnectionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionFailure {
+    ConnectionClosed,
+    HeartbeatTimeout,
+    MessageParse,
+}
+
+impl ConnectionFailure {
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::ConnectionClosed => WsError::ConnectionClosed.into(),
+            Self::HeartbeatTimeout => WsError::Timeout.into(),
+            Self::MessageParse => {
+                WsError::InvalidMessage("WebSocket message parsing failed".to_owned()).into()
+            }
+        }
+    }
+}
+
 /// Manages WebSocket connection lifecycle, reconnection, and heartbeat.
 ///
 /// This generic connection manager handles all WebSocket connection concerns:
@@ -100,6 +119,10 @@ where
     sender_tx: mpsc::UnboundedSender<String>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
+    /// Latest connection-generation or application-level PONG evidence
+    liveness_tx: watch::Sender<Option<Instant>>,
+    /// Terminal connection failure visible to authenticated subscribers
+    failure_tx: watch::Sender<Option<ConnectionFailure>>,
     /// Phantom data for unused type parameters
     _phantom: PhantomData<P>,
 }
@@ -118,12 +141,16 @@ where
         let (sender_tx, sender_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+        let (liveness_tx, _) = watch::channel(None);
+        let (failure_tx, _) = watch::channel(None);
 
         // Spawn connection task
         let connection_config = config;
         let connection_endpoint = endpoint;
         let broadcast_tx_clone = broadcast_tx.clone();
         let state_tx_clone = state_tx.clone();
+        let liveness_tx_clone = liveness_tx.clone();
+        let failure_tx_clone = failure_tx.clone();
 
         tokio::spawn(async move {
             Self::connection_loop(
@@ -133,6 +160,8 @@ where
                 broadcast_tx_clone,
                 parser,
                 state_tx_clone,
+                liveness_tx_clone,
+                failure_tx_clone,
             )
             .await;
         });
@@ -142,6 +171,8 @@ where
             state_rx,
             sender_tx,
             broadcast_tx,
+            liveness_tx,
+            failure_tx,
             _phantom: PhantomData,
         })
     }
@@ -154,6 +185,8 @@ where
         broadcast_tx: broadcast::Sender<M>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
+        liveness_tx: watch::Sender<Option<Instant>>,
+        failure_tx: watch::Sender<Option<ConnectionFailure>>,
     ) {
         let mut attempt = 0_u32;
         let mut backoff: backoff::ExponentialBackoff = config.reconnect.clone().into();
@@ -164,20 +197,24 @@ where
                 #[cfg(feature = "tracing")]
                 tracing::debug!("Sender channel closed, stopping connection loop");
                 _ = state_tx.send(ConnectionState::Disconnected);
+                liveness_tx.send_replace(None);
                 break;
             }
 
             let state_rx = state_tx.subscribe();
 
             _ = state_tx.send(ConnectionState::Connecting);
+            liveness_tx.send_replace(None);
 
             // Attempt connection
             match connect_async(&endpoint).await {
                 Ok((ws_stream, _)) => {
                     attempt = 0;
                     backoff.reset();
+                    let connected_at = Instant::now();
+                    liveness_tx.send_replace(Some(connected_at));
                     _ = state_tx.send(ConnectionState::Connected {
-                        since: Instant::now(),
+                        since: connected_at,
                     });
 
                     // Handle connection
@@ -186,6 +223,8 @@ where
                         &mut sender_rx,
                         &broadcast_tx,
                         state_rx,
+                        &liveness_tx,
+                        &failure_tx,
                         config.clone(),
                         &parser,
                     )
@@ -230,6 +269,8 @@ where
         sender_rx: &mut mpsc::UnboundedReceiver<String>,
         broadcast_tx: &broadcast::Sender<M>,
         state_rx: watch::Receiver<ConnectionState>,
+        liveness_tx: &watch::Sender<Option<Instant>>,
+        failure_tx: &watch::Sender<Option<ConnectionFailure>>,
         config: Config,
         parser: &P,
     ) -> Result<()> {
@@ -239,19 +280,22 @@ where
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
 
-        let heartbeat_handle = tokio::spawn(async move {
-            Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
-        });
+        let mut heartbeat_handle =
+            tokio::spawn(
+                async move { Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await },
+            );
 
-        loop {
+        let failure = loop {
             tokio::select! {
                 // Handle incoming messages
-                Some(msg) = read.next() => {
+                msg = read.next() => {
                     match msg {
-                        Ok(Message::Text(text)) if text == "PONG" => {
-                            _ = pong_tx.send(Instant::now());
+                        Some(Ok(Message::Text(text))) if text == "PONG" => {
+                            let observed_at = Instant::now();
+                            _ = pong_tx.send(observed_at);
+                            liveness_tx.send_replace(Some(observed_at));
                         }
-                        Ok(Message::Text(text)) => {
+                        Some(Ok(Message::Text(text))) => {
                             #[cfg(feature = "tracing")]
                             tracing::trace!(%text, "Received WebSocket text message");
 
@@ -266,27 +310,24 @@ where
                                 }
                                 Err(e) => {
                                     #[cfg(feature = "tracing")]
-                                    tracing::warn!(%text, error = %e, "Failed to parse WebSocket message");
+                                    tracing::warn!(error = %e, "Failed to parse WebSocket message");
                                     #[cfg(not(feature = "tracing"))]
-                                    let _: (&_, &_) = (&text, &e);
+                                    let _: &_ = &e;
+                                    break ConnectionFailure::MessageParse;
                                 }
                             }
                         }
-                        Ok(Message::Close(_)) => {
-                            heartbeat_handle.abort();
-                            return Err(Error::with_source(
-                                Kind::WebSocket,
-                                WsError::ConnectionClosed,
-                            ))
+                        Some(Ok(Message::Close(_))) | None => {
+                            break ConnectionFailure::ConnectionClosed;
                         }
-                        Err(e) => {
-                            heartbeat_handle.abort();
-                            return Err(Error::with_source(
-                                Kind::WebSocket,
-                                WsError::Connection(e),
-                            ));
+                        Some(Err(e)) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(error = %e, "WebSocket receive failed");
+                            #[cfg(not(feature = "tracing"))]
+                            let _: &_ = &e;
+                            break ConnectionFailure::ConnectionClosed;
                         }
-                        _ => {
+                        Some(Ok(_)) => {
                             // Ignore binary frames and unsolicited PONG replies.
                         }
                     }
@@ -295,28 +336,37 @@ where
                 // Handle outgoing messages from subscriptions
                 Some(text) = sender_rx.recv() => {
                     if write.send(Message::Text(text.into())).await.is_err() {
-                        break;
+                        break ConnectionFailure::ConnectionClosed;
                     }
                 }
 
                 // Handle PING requests from heartbeat loop
                 Some(()) = ping_rx.recv() => {
                     if write.send(Message::Text("PING".into())).await.is_err() {
-                        break;
+                        break ConnectionFailure::ConnectionClosed;
                     }
+                }
+
+                heartbeat_result = &mut heartbeat_handle => {
+                    break match heartbeat_result {
+                        Ok(Some(failure)) => failure,
+                        Ok(None) | Err(_) => ConnectionFailure::ConnectionClosed,
+                    };
                 }
 
                 // Check if connection is still active
                 else => {
-                    break;
+                    break ConnectionFailure::ConnectionClosed;
                 }
             }
-        }
+        };
 
         // Cleanup
         heartbeat_handle.abort();
+        liveness_tx.send_replace(None);
+        failure_tx.send_replace(Some(failure));
 
-        Ok(())
+        Err(failure.into_error())
     }
 
     /// Heartbeat loop that sends PING messages and monitors PONG responses.
@@ -325,7 +375,7 @@ where
         state_rx: watch::Receiver<ConnectionState>,
         config: &Config,
         mut pong_rx: watch::Receiver<Instant>,
-    ) {
+    ) -> Option<ConnectionFailure> {
         let mut ping_interval = interval(config.heartbeat_interval);
 
         loop {
@@ -333,7 +383,7 @@ where
 
             // Check if still connected
             if !state_rx.borrow().is_connected() {
-                break;
+                return None;
             }
 
             // Mark current PONG state as seen before sending PING
@@ -344,7 +394,7 @@ where
             let ping_sent = Instant::now();
             if ping_tx.send(()).is_err() {
                 // Message loop has terminated
-                break;
+                return None;
             }
 
             // Wait for PONG within timeout
@@ -358,12 +408,12 @@ where
                         tracing::debug!(
                             "PONG received but older than last PING, connection may be stale"
                         );
-                        break;
+                        return Some(ConnectionFailure::HeartbeatTimeout);
                     }
                 }
                 Ok(Err(_)) => {
                     // Channel closed, connection is terminating
-                    break;
+                    return None;
                 }
                 Err(_) => {
                     // Timeout waiting for PONG
@@ -372,7 +422,7 @@ where
                         "Heartbeat timeout: no PONG received within {:?}",
                         config.heartbeat_timeout
                     );
-                    break;
+                    return Some(ConnectionFailure::HeartbeatTimeout);
                 }
             }
         }
@@ -406,6 +456,12 @@ where
         *self.state_rx.borrow()
     }
 
+    /// Return the latest connection-generation or application-level PONG evidence.
+    #[must_use]
+    pub fn liveness(&self) -> Option<Instant> {
+        *self.liveness_tx.borrow()
+    }
+
     /// Subscribe to incoming messages.
     ///
     /// Each call returns a new independent receiver. Multiple subscribers can
@@ -422,5 +478,9 @@ where
     #[must_use]
     pub fn state_receiver(&self) -> watch::Receiver<ConnectionState> {
         self.state_tx.subscribe()
+    }
+
+    pub(crate) fn failure_receiver(&self) -> watch::Receiver<Option<ConnectionFailure>> {
+        self.failure_tx.subscribe()
     }
 }

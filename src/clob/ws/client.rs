@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_stream::try_stream;
 use dashmap::mapref::one::{Ref, RefMut};
@@ -370,6 +371,15 @@ impl<S: State> Client<S> {
         )
     }
 
+    /// Return the latest connection-generation or application-level PONG evidence.
+    #[must_use]
+    pub fn connection_liveness(&self, channel_type: ChannelType) -> Option<Instant> {
+        self.inner
+            .channel(channel_type)
+            .as_deref()
+            .and_then(ChannelResources::connection_liveness)
+    }
+
     /// Check if the WebSocket connection is established for a specific channel.
     ///
     /// Returns `false` if no subscriptions have been made yet for this channel.
@@ -640,6 +650,10 @@ impl ChannelResources {
 
     fn connection_state(&self) -> ConnectionState {
         self.connection.state()
+    }
+
+    fn connection_liveness(&self) -> Option<Instant> {
+        self.connection.liveness()
     }
 }
 

@@ -33,11 +33,16 @@ struct MockWsServer {
 impl MockWsServer {
     /// Start a mock WebSocket server on a random port.
     async fn start() -> Self {
+        Self::start_with_pong(false).await
+    }
+
+    /// Start a mock server that can answer application-level PING messages.
+    async fn start_with_pong(respond_to_ping: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         // Broadcast channel for sending to ALL clients
-        let (message_tx, _) = broadcast::channel::<String>(100);
+        let (message_tx, _) = broadcast::channel::<String>(2048);
         let (subscription_tx, subscription_rx) = mpsc::unbounded_channel::<String>();
 
         let broadcast_tx = message_tx.clone();
@@ -63,6 +68,11 @@ impl MockWsServer {
                             // Handle incoming messages from client
                             msg = read.next() => {
                                 match msg {
+                                    Some(Ok(Message::Text(text))) if text == "PING" && respond_to_ping => {
+                                        if write.send(Message::Text("PONG".into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                     Some(Ok(Message::Text(text))) if text != "PING" => {
                                         drop(sub_tx.send(text.to_string()));
                                     }
@@ -462,9 +472,11 @@ mod market_channel {
 mod user_channel {
     use polymarket_client_sdk_v2::auth::Credentials;
     use polymarket_client_sdk_v2::clob::types::Side;
-    use polymarket_client_sdk_v2::clob::ws::types::response::{
-        OrderMessageType, TradeMessageStatus,
+    use polymarket_client_sdk_v2::clob::ws::{
+        ChannelType,
+        types::response::{OrderMessageType, TradeMessageStatus},
     };
+    use polymarket_client_sdk_v2::ws::WsError;
     use rust_decimal_macros::dec;
     use tokio::time::sleep;
 
@@ -474,6 +486,174 @@ mod user_channel {
 
     fn test_credentials() -> Credentials {
         Credentials::new(API_KEY, SECRET.to_owned(), PASSPHRASE.to_owned())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_fails_user_stream_and_disconnects() {
+        let server = MockWsServer::start().await;
+        let base_endpoint = format!("ws://{}", server.addr);
+        let mut config = Config::default();
+        config.heartbeat_interval = Duration::from_millis(10);
+        config.heartbeat_timeout = Duration::from_millis(20);
+        config.reconnect.max_attempts = Some(0);
+        let client = Client::new(&base_endpoint, config)
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        let stream = client.subscribe_user_events(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+
+        let error = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .expect("failure is emitted")
+            .expect_err("heartbeat timeout must fail the user stream");
+        assert!(matches!(
+            error.downcast_ref::<WsError>(),
+            Some(WsError::Timeout)
+        ));
+        timeout(Duration::from_secs(1), async {
+            while !matches!(
+                client.connection_state(ChannelType::User),
+                polymarket_client_sdk_v2::ws::connection::ConnectionState::Disconnected
+            ) {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parser_error_fails_user_stream_and_disconnects() {
+        let mut server = MockWsServer::start().await;
+        let base_endpoint = format!("ws://{}", server.addr);
+        let mut config = Config::default();
+        config.reconnect.max_attempts = Some(0);
+        let client = Client::new(&base_endpoint, config)
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        let stream = client.subscribe_user_events(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        server.send("not-json");
+        let error = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .expect("failure is emitted")
+            .expect_err("parser failure must fail the user stream");
+        assert!(matches!(
+            error.downcast_ref::<WsError>(),
+            Some(WsError::InvalidMessage(message))
+                if message == "WebSocket message parsing failed"
+        ));
+        assert!(matches!(
+            client.connection_state(ChannelType::User),
+            polymarket_client_sdk_v2::ws::connection::ConnectionState::Disconnected
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_interested_user_array_element_fails_user_stream() {
+        let mut server = MockWsServer::start().await;
+        let base_endpoint = format!("ws://{}", server.addr);
+        let mut config = Config::default();
+        config.reconnect.max_attempts = Some(0);
+        let client = Client::new(&base_endpoint, config)
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        let stream = client.subscribe_user_events(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        server.send(r#"[{"event_type":"order"}]"#);
+        let error = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .expect("failure is emitted")
+            .expect_err("malformed interested user event must fail the user stream");
+        assert!(matches!(
+            error.downcast_ref::<WsError>(),
+            Some(WsError::InvalidMessage(message))
+                if message == "WebSocket message parsing failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn application_pong_advances_liveness_without_resubscribing() {
+        let mut server = MockWsServer::start_with_pong(true).await;
+        let base_endpoint = format!("ws://{}", server.addr);
+        let mut config = Config::default();
+        config.heartbeat_interval = Duration::from_millis(20);
+        config.heartbeat_timeout = Duration::from_millis(100);
+        config.reconnect.max_attempts = Some(0);
+        let client = Client::new(&base_endpoint, config)
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        let _stream = client.subscribe_user_events(vec![]).unwrap();
+        let _: Option<String> = server.recv_subscription().await;
+        let initial = client
+            .connection_liveness(ChannelType::User)
+            .expect("connected generation is liveness evidence");
+
+        let advanced = timeout(Duration::from_secs(1), async {
+            loop {
+                let state = client.connection_state(ChannelType::User);
+                if client
+                    .connection_liveness(ChannelType::User)
+                    .is_some_and(|observed| observed > initial)
+                {
+                    break state;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            advanced,
+            polymarket_client_sdk_v2::ws::connection::ConnectionState::Connected { .. }
+        ));
+        assert!(
+            timeout(Duration::from_millis(100), server.recv_subscription())
+                .await
+                .is_err(),
+            "PONG must not produce another user subscription request"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_fails_user_stream() {
+        let mut server = MockWsServer::start().await;
+        let base_endpoint = format!("ws://{}", server.addr);
+        let client = Client::new(&base_endpoint, Config::default())
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        let stream = client.subscribe_user_events(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        let _: Option<String> = server.recv_subscription().await;
+        let order = payloads::order().to_string();
+
+        for _ in 0..1100 {
+            server.send(&order);
+        }
+        sleep(Duration::from_millis(500)).await;
+
+        let error = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .expect("lag failure is emitted")
+            .expect_err("broadcast lag must fail the user stream");
+        assert!(matches!(
+            error.downcast_ref::<WsError>(),
+            Some(WsError::InvalidMessage(message))
+                if message.contains("authenticated user subscription lagged")
+        ));
     }
 
     #[tokio::test]
