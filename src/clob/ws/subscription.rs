@@ -16,12 +16,19 @@ use tokio::sync::broadcast::error::RecvError;
 use super::interest::{InterestTracker, MessageInterest};
 use super::types::request::SubscriptionRequest;
 use super::types::response::WsMessage;
-use crate::Result;
 use crate::auth::Credentials;
 use crate::types::{B256, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::WsError;
 use crate::ws::connection::ConnectionState;
+use crate::{Result, error::Error};
+
+fn user_subscription_lag_error(missed: u64) -> Error {
+    WsError::InvalidMessage(format!(
+        "authenticated user subscription lagged and missed {missed} messages"
+    ))
+    .into()
+}
 
 /// What a subscription is targeting.
 #[non_exhaustive]
@@ -391,24 +398,41 @@ impl SubscriptionManager {
 
         // Create stream for user messages
         let mut rx = self.connection.subscribe();
+        let mut failure_rx = self.connection.failure_receiver();
 
         Ok(try_stream! {
             loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if msg.is_user() {
-                            yield msg;
+                let failure = *failure_rx.borrow();
+                if let Some(failure) = failure {
+                    Err::<(), Error>(failure.into_error())?;
+                }
+
+                let next = tokio::select! {
+                    biased;
+
+                    changed = failure_rx.changed() => {
+                        if changed.is_err() {
+                            Err(WsError::ConnectionClosed.into())
+                        } else {
+                            let failure = *failure_rx.borrow();
+                            match failure {
+                                Some(failure) => Err(failure.into_error()),
+                                None => Ok(None),
+                            }
                         }
                     }
-                    Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Subscription lagged, missed {n} messages — continuing");
+
+                    message = rx.recv() => match message {
+                        Ok(msg) => Ok(Some(msg)),
+                        Err(RecvError::Lagged(n)) => Err(user_subscription_lag_error(n)),
+                        Err(RecvError::Closed) => Err(WsError::ConnectionClosed.into()),
                     }
-                    Err(RecvError::Closed) => {
-                        break;
-                    }
+                };
+
+                match next {
+                    Ok(Some(msg)) if msg.is_user() => yield msg,
+                    Ok(_) => {}
+                    Err(error) => Err::<(), Error>(error)?,
                 }
             }
         })

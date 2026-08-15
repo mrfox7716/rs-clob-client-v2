@@ -490,8 +490,8 @@ pub struct MidpointUpdate {
 /// extracted to check interest before final deserialization via `from_value()`.
 /// This avoids re-parsing the JSON text twice.
 ///
-/// For arrays, messages are processed one-by-one with tolerant parsing: unknown or invalid
-/// event types are skipped rather than causing the entire batch to fail.
+/// For arrays, public-market messages retain tolerant parsing, while a malformed interested
+/// user event fails the batch so authenticated account evidence is never silently dropped.
 pub fn parse_if_interested(
     bytes: &[u8],
     interest: &MessageInterest,
@@ -515,28 +515,41 @@ pub fn parse_if_interested(
                 }
             }
         }
-        Value::Array(arr) => Ok(arr
-            .iter()
-            .filter_map(|elem| {
-                let obj = elem.as_object()?;
-                let event_type = obj.get("event_type").and_then(Value::as_str)?;
-
+        Value::Array(arr) => {
+            let mut messages = Vec::with_capacity(arr.len());
+            for elem in arr {
+                let Some(obj) = elem.as_object() else {
+                    continue;
+                };
+                let Some(event_type) = obj.get("event_type").and_then(Value::as_str) else {
+                    continue;
+                };
                 if !interest.is_interested_in_event(event_type) {
-                    return None;
+                    continue;
                 }
 
-                serde_json::from_value(elem.clone())
-                    .inspect_err(|err| {
+                match serde_json::from_value(elem.clone()) {
+                    Ok(message) => messages.push(message),
+                    Err(err)
+                        if MessageInterest::USER
+                            .contains(MessageInterest::from_event_type(event_type)) =>
+                    {
+                        return Err(err.into());
+                    }
+                    Err(err) => {
                         #[cfg(feature = "tracing")]
                         warn!(
                             event_type = %event_type,
                             error = %err,
-                            "Skipping unknown/invalid WS event in batch"
+                            "Skipping unknown/invalid public WS event in batch"
                         );
-                    })
-                    .ok()
-            })
-            .collect()),
+                        #[cfg(not(feature = "tracing"))]
+                        let _: &_ = &err;
+                    }
+                }
+            }
+            Ok(messages)
+        }
         _ => Ok(vec![]),
     }
 }
@@ -1063,6 +1076,19 @@ mod tests {
 
         let msgs = parse_if_interested(b"true", &MessageInterest::ALL).unwrap();
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn malformed_interested_array_element_is_strict_only_for_user_events() {
+        let malformed_market = br#"[{"event_type":"book"}]"#;
+        assert!(
+            parse_if_interested(malformed_market, &MessageInterest::BOOK)
+                .unwrap()
+                .is_empty()
+        );
+
+        let malformed_user = br#"[{"event_type":"order"}]"#;
+        assert!(parse_if_interested(malformed_user, &MessageInterest::USER).is_err());
     }
 
     // New test: Batch with mixed known + unknown event_type
