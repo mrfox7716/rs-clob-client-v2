@@ -519,10 +519,29 @@ pub fn parse_if_interested(
             let mut messages = Vec::with_capacity(arr.len());
             for elem in arr {
                 let Some(obj) = elem.as_object() else {
+                    if interest.intersects(MessageInterest::USER) {
+                        return Err(<serde_json::Error as serde::de::Error>::custom(
+                            "user websocket array element must be an object",
+                        )
+                        .into());
+                    }
                     continue;
                 };
-                let Some(event_type) = obj.get("event_type").and_then(Value::as_str) else {
-                    continue;
+                let event_type = match obj.get("event_type") {
+                    Some(Value::String(event_type)) => event_type.as_str(),
+                    Some(_) if interest.intersects(MessageInterest::USER) => {
+                        return Err(<serde_json::Error as serde::de::Error>::custom(
+                            "user websocket array event_type must be a string",
+                        )
+                        .into());
+                    }
+                    None if interest.intersects(MessageInterest::USER) => {
+                        return Err(<serde_json::Error as serde::de::Error>::custom(
+                            "user websocket array event_type is required",
+                        )
+                        .into());
+                    }
+                    Some(_) | None => continue,
                 };
                 if !interest.is_interested_in_event(event_type) {
                     continue;
@@ -1089,6 +1108,22 @@ mod tests {
 
         let malformed_user = br#"[{"event_type":"order"}]"#;
         assert!(parse_if_interested(malformed_user, &MessageInterest::USER).is_err());
+    }
+
+    #[test]
+    fn malformed_untyped_array_elements_are_strict_only_for_user_interest() {
+        for malformed in [
+            br#"[{}]"#.as_slice(),
+            br#"[null]"#.as_slice(),
+            br#"[{"event_type":null}]"#.as_slice(),
+        ] {
+            assert!(parse_if_interested(malformed, &MessageInterest::USER).is_err());
+            assert!(
+                parse_if_interested(malformed, &MessageInterest::MARKET)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     // New test: Batch with mixed known + unknown event_type
