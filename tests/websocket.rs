@@ -583,6 +583,37 @@ mod user_channel {
     }
 
     #[tokio::test]
+    async fn malformed_single_user_object_fails_user_stream_and_disconnects() {
+        let mut server = MockWsServer::start().await;
+        let base_endpoint = format!("ws://{}", server.addr);
+        let mut config = Config::default();
+        config.reconnect.max_attempts = Some(0);
+        let client = Client::new(&base_endpoint, config)
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        let stream = client.subscribe_user_events(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        let _: Option<String> = server.recv_subscription().await;
+
+        server.send(r#"{"some_field":"value"}"#);
+        let error = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .expect("failure is emitted")
+            .expect_err("malformed single user object must fail the user stream");
+        assert!(matches!(
+            error.downcast_ref::<WsError>(),
+            Some(WsError::InvalidMessage(message))
+                if message == "WebSocket message parsing failed"
+        ));
+        assert!(matches!(
+            client.connection_state(ChannelType::User),
+            polymarket_client_sdk_v2::ws::connection::ConnectionState::Disconnected
+        ));
+    }
+
+    #[tokio::test]
     async fn application_pong_advances_liveness_without_resubscribing() {
         let mut server = MockWsServer::start_with_pong(true).await;
         let base_endpoint = format!("ws://{}", server.addr);

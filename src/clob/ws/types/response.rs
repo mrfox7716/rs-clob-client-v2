@@ -503,17 +503,30 @@ pub fn parse_if_interested(
     match &value {
         Value::Object(map) => {
             // Single message: check event_type before full deserialization
-            let event_type = map.get("event_type").and_then(Value::as_str);
-
-            match event_type {
-                None => Ok(vec![]),
-                Some(event_type) if !interest.is_interested_in_event(event_type) => Ok(vec![]),
-                Some(_) => {
-                    // Interested: deserialize from cached Value (no re-parsing)
-                    let msg: WsMessage = serde_json::from_value(value)?;
-                    Ok(vec![msg])
+            let event_type = match map.get("event_type") {
+                Some(Value::String(event_type)) => event_type.as_str(),
+                Some(_) if interest.intersects(MessageInterest::USER) => {
+                    return Err(<serde_json::Error as serde::de::Error>::custom(
+                        "user websocket object event_type must be a string",
+                    )
+                    .into());
                 }
+                None if interest.intersects(MessageInterest::USER) => {
+                    return Err(<serde_json::Error as serde::de::Error>::custom(
+                        "user websocket object event_type is required",
+                    )
+                    .into());
+                }
+                Some(_) | None => return Ok(vec![]),
+            };
+
+            if !interest.is_interested_in_event(event_type) {
+                return Ok(vec![]);
             }
+
+            // Interested: deserialize from cached Value (no re-parsing)
+            let msg: WsMessage = serde_json::from_value(value)?;
+            Ok(vec![msg])
         }
         Value::Array(arr) => {
             let mut messages = Vec::with_capacity(arr.len());
@@ -568,6 +581,12 @@ pub fn parse_if_interested(
                 }
             }
             Ok(messages)
+        }
+        _ if interest.intersects(MessageInterest::USER) => {
+            Err(<serde_json::Error as serde::de::Error>::custom(
+                "user websocket payload must be an object or array",
+            )
+            .into())
         }
         _ => Ok(vec![]),
     }
@@ -1074,27 +1093,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_if_interested_returns_empty_for_missing_event_type() {
-        // Object without event_type field
-        let json = r#"{"some_field": "value"}"#;
-        let msgs = parse_if_interested(json.as_bytes(), &MessageInterest::ALL).unwrap();
-        assert!(msgs.is_empty());
+    fn malformed_single_event_type_is_strict_only_for_user_interest() {
+        for malformed in [
+            b"{}".as_slice(),
+            br#"{"some_field":"value"}"#.as_slice(),
+            br#"{"event_type":null}"#.as_slice(),
+            br#"{"event_type":42}"#.as_slice(),
+            br#"{"event_type":true}"#.as_slice(),
+            br#"{"event_type":[]}"#.as_slice(),
+            br#"{"event_type":{}}"#.as_slice(),
+        ] {
+            assert!(parse_if_interested(malformed, &MessageInterest::USER).is_err());
+            assert!(
+                parse_if_interested(malformed, &MessageInterest::MARKET)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
-    fn parse_if_interested_returns_empty_for_primitive_json() {
-        // JSON primitives (not object or array) should return empty
-        let msgs = parse_if_interested(b"null", &MessageInterest::ALL).unwrap();
-        assert!(msgs.is_empty());
+    fn primitive_payloads_are_strict_only_for_user_interest() {
+        for malformed in [
+            b"null".as_slice(),
+            b"42".as_slice(),
+            b"\"string\"".as_slice(),
+            b"true".as_slice(),
+        ] {
+            assert!(parse_if_interested(malformed, &MessageInterest::USER).is_err());
+            assert!(
+                parse_if_interested(malformed, &MessageInterest::MARKET)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
 
-        let msgs = parse_if_interested(b"42", &MessageInterest::ALL).unwrap();
-        assert!(msgs.is_empty());
-
-        let msgs = parse_if_interested(b"\"string\"", &MessageInterest::ALL).unwrap();
-        assert!(msgs.is_empty());
-
-        let msgs = parse_if_interested(b"true", &MessageInterest::ALL).unwrap();
-        assert!(msgs.is_empty());
+    #[test]
+    fn unknown_single_event_type_remains_tolerant() {
+        let unknown = br#"{"event_type":"SOME_NEW_EVENT"}"#;
+        for interest in [MessageInterest::USER, MessageInterest::MARKET] {
+            assert!(parse_if_interested(unknown, &interest).unwrap().is_empty());
+        }
     }
 
     #[test]
